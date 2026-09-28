@@ -1,0 +1,85 @@
+name: CI
+
+# Test gate for this repository. The URDF/xacro descriptions *are* the
+# deliverable, so the gate validates them: every xacro expands, every URDF
+# parses, every referenced mesh exists, and every XML file is well formed.
+# Releases live in their own workflow (see .github/workflows/release.yml).
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true # a superseded pull request run is pointless
+
+jobs:
+  # The job must be named `test`: that is the required status check.
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburdfdom-tools libxml2-utils
+          python3 -m pip install --upgrade pip xacro
+
+      - name: Expand every xacro and parse every URDF
+        run: |
+          set -euo pipefail
+          shopt -s nullglob globstar
+          for f in **/*.xacro; do
+            out="${f%.xacro}"
+            [[ "$out" == *.urdf ]] || out="${out}.urdf"
+            echo "xacro $f"
+            xacro "$f" > "$out"
+          done
+          for f in **/*.urdf; do
+            echo "check_urdf $f"
+            check_urdf "$f" > /dev/null
+          done
+          for f in **/package.xml **/*.launch; do
+            echo "xmllint $f"
+            xmllint --noout "$f"
+          done
+          for f in **/*.launch.py; do
+            echo "py_compile $f"
+            python3 -m py_compile "$f"
+          done
+
+      - name: Check that every referenced mesh exists
+        run: |
+          python3 - <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          packages = {}
+          for manifest in Path(".").rglob("package.xml"):
+              match = re.search(r"<name>\s*([^<\s]+)\s*</name>", manifest.read_text())
+              if match:
+                  packages[match.group(1)] = manifest.parent
+
+          problems = []
+          for urdf in Path(".").rglob("*.urdf"):
+              for ref in re.findall(r'filename="([^"]+)"', urdf.read_text()):
+                  if not ref.startswith("package://"):
+                      continue
+                  package, _, relative = ref[len("package://"):].partition("/")
+                  root = packages.get(package)
+                  if root is None:
+                      problems.append(f"{urdf}: references unknown package {package}")
+                  elif not (root / relative).exists():
+                      problems.append(f"{urdf}: missing {ref}")
+
+          print("\n".join(problems) if problems else "all referenced meshes exist")
+          sys.exit(1 if problems else 0)
+          PY
